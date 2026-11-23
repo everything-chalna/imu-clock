@@ -61,6 +61,7 @@ iPhone/iPad: Safari/Chrome can't do Bluetooth &mdash; open this link in the free
     <tr><td>Difference</td><td id="diff">&ndash;</td></tr>
     <tr><td>Firmware</td><td id="fw">&ndash;</td></tr>
     <tr><td>Bluetooth profile</td><td id="prof">&ndash;</td></tr>
+    <tr><td>SD card / blackbox</td><td id="sd">&ndash;</td></tr>
   </table>
 </div>
 
@@ -70,11 +71,11 @@ iPhone/iPad: Safari/Chrome can't do Bluetooth &mdash; open this link in the free
 </div>
 <p><small>Log:</small></p>
 <div id="log"></div>
-<p><small>Page version PRD-279 v1 (2026-11-23). Sends Betaflight MSP_SET_RTC (246) over Bluetooth LE, then reads it back with MSP_RTC (247). Nothing else on the flight controller is changed and nothing is saved to its settings.</small></p>
+<p><small>Page version v2 (2026-11-23). Sends Betaflight MSP_SET_RTC (246) over Bluetooth LE, then reads it back with MSP_RTC (247). Nothing else on the flight controller is changed and nothing is saved to its settings.</small></p>
 
 <script>
 // ===== BEGIN CORE (pure functions, unit-tested with node) =====
-const MSP = { API_VERSION: 1, FC_VARIANT: 2, FC_VERSION: 3, BOARD_INFO: 4, SET_RTC: 246, RTC: 247 };
+const MSP = { API_VERSION: 1, FC_VARIANT: 2, FC_VERSION: 3, BOARD_INFO: 4, SDCARD_SUMMARY: 79, BLACKBOX_CONFIG: 80, SET_RTC: 246, RTC: 247 };
 
 // MSP v1 request: '$' 'M' '<' len cmd payload... checksum (XOR of len, cmd and payload bytes)
 function encodeMspV1(cmd, payload) {
@@ -141,9 +142,11 @@ if (typeof module !== "undefined") { module.exports = { MSP, encodeMspV1, rtcPay
   // Same profiles as betaflight-configurator src/js/protocols/devices.ts ([service, write, read]).
   // SpeedyBee first; everything else as fallback.
   const PROFILES = [
+    // SpeedyBee's own Android app (BluetoothLeService) looks for abf0 (ESP32 BLE-SPP: abf1 write-no-response, abf2 notify)
+    // and 1000 (1001/1002); Betaflight Configurator connects SpeedyBee F405/F7 boards on abf0.
+    { name: "SpeedyBee abf0 (ESP32 SPP)", s: bt16("abf0"), w: bt16("abf1"), r: bt16("abf2") },
+    { name: "SpeedyBee 1000", s: bt16("1000"), w: bt16("1001"), r: bt16("1002") },
     { name: "SpeedyBee FF00", s: bt16("00ff"), w: bt16("ff01"), r: bt16("ff02") },
-    { name: "SpeedyBee V2 (abf0)", s: bt16("abf0"), w: bt16("abf1"), r: bt16("abf2") },
-    { name: "SpeedyBee V1 (1000)", s: bt16("1000"), w: bt16("1001"), r: bt16("1002") },
     { name: "CC2541 / HM-10 (ffe0)", s: bt16("ffe0"), w: bt16("ffe1"), r: bt16("ffe2") },
     { name: "HM-10 (ffe1 service)", s: bt16("ffe1"), w: bt16("ffe1"), r: bt16("ffe1") },
     { name: "Nordic UART", s: "6e400001-b5a3-f393-e0a9-e50e24dcca9e", w: "6e400002-b5a3-f393-e0a9-e50e24dcca9e", r: "6e400003-b5a3-f393-e0a9-e50e24dcca9e" },
@@ -225,13 +228,25 @@ if (typeof module !== "undefined") { module.exports = { MSP, encodeMspV1, rtcPay
     };
     cand.r.addEventListener("characteristicvaluechanged", onNotify);
     await cand.r.startNotifications();
+    // The SpeedyBee app writes with WRITE_TYPE_NO_RESPONSE in 20-byte chunks; do the same, falling back to the other write type.
+    let preferNoResp = !!cand.w.properties.writeWithoutResponse;
+    async function writeChunk(chunk) {
+      const w = cand.w;
+      const noResp = () => w.writeValueWithoutResponse ? w.writeValueWithoutResponse(chunk) : w.writeValue(chunk);
+      const withResp = () => w.writeValueWithResponse ? w.writeValueWithResponse(chunk) : w.writeValue(chunk);
+      try { await (preferNoResp ? noResp() : withResp()); }
+      catch (e) {
+        const other = preferNoResp ? w.properties.write : w.properties.writeWithoutResponse;
+        if (!other) throw e;
+        log(`  write (${preferNoResp ? "no-response" : "with-response"}) failed: ${e.message}; switching write type`);
+        preferNoResp = !preferNoResp;
+        await (preferNoResp ? noResp() : withResp());
+      }
+    }
     async function write(bytes) {
       for (let i = 0; i < bytes.length; i += 20) {   // 20 bytes = safe default BLE MTU payload
-        const chunk = bytes.slice(i, i + 20);
-        const w = cand.w;
-        if (w.properties.write && w.writeValueWithResponse) await w.writeValueWithResponse(chunk);
-        else if (w.properties.writeWithoutResponse && w.writeValueWithoutResponse) await w.writeValueWithoutResponse(chunk);
-        else await w.writeValue(chunk);
+        await writeChunk(bytes.slice(i, i + 20));
+        if (preferNoResp && i + 20 < bytes.length) await sleep(20);
       }
     }
     async function request(cmd, payloadFn, { tries = 3, timeout = 1500 } = {}) {
@@ -251,7 +266,7 @@ if (typeof module !== "undefined") { module.exports = { MSP, encodeMspV1, rtcPay
 
   async function run() {
     $("go").disabled = true;
-    for (const id of ["sentUtc", "sentKst", "sentLocal", "sentEpoch", "readUtc", "diff", "fw", "prof"]) $(id).textContent = "–";
+    for (const id of ["sentUtc", "sentKst", "sentLocal", "sentEpoch", "readUtc", "diff", "fw", "prof", "sd"]) $(id).textContent = "–";
     result("", "Working… choose the SpeedyBee device in the Bluetooth popup.");
     try {
       if (!navigator.bluetooth) { result("err", "<b>Bluetooth not available in this browser.</b><br>" + unsupportedMessage()); log("ERROR: navigator.bluetooth missing"); return; }
@@ -314,6 +329,19 @@ if (typeof module !== "undefined") { module.exports = { MSP, encodeMspV1, rtcPay
       const bi = await msp.request(MSP.BOARD_INFO, null, { tries: 1 });
       if (bi && !bi.error && bi.payload.length >= 4) fw += ` · board ${new TextDecoder().decode(bi.payload.slice(0, 4))}`;
       $("fw").textContent = fw; log("Firmware: " + fw);
+      // Diagnostics only: SD card and blackbox device (helps us if the log still shows no date).
+      const sd = await msp.request(MSP.SDCARD_SUMMARY, null, { tries: 1 });
+      if (sd && !sd.error && sd.payload.length >= 3) {
+        const st = !(sd.payload[0] & 1) ? "no SD support" : (["not present", "fatal error", "card init", "filesystem init", "ready"][sd.payload[1]] ?? sd.payload[1]);
+        log(`SD card: supported=${sd.payload[0] & 1} state=${st} lastError=${sd.payload[2]}`);
+        $("sd").textContent = `${st}`;
+      }
+      const bb = await msp.request(MSP.BLACKBOX_CONFIG, null, { tries: 1 });
+      if (bb && !bb.error && bb.payload.length >= 2) {
+        const dev = ["NONE", "onboard flash", "SD card", "serial"][bb.payload[1]] || bb.payload[1];
+        log(`Blackbox: supported=${bb.payload[0]} device=${dev} raw=${hex(bb.payload)}`);
+        $("sd").textContent += ` · blackbox → ${dev}`;
+      }
 
       let sentMs = null;
       const ack = await msp.request(MSP.SET_RTC, () => { sentMs = Date.now(); log(`  payload for ${new Date(sentMs).toISOString()}: ${hex(rtcPayload(sentMs))}`); return rtcPayload(sentMs); }, { tries: 3 });
@@ -357,8 +385,8 @@ if (typeof module !== "undefined") { module.exports = { MSP, encodeMspV1, rtcPay
   $("go").addEventListener("click", run);
   $("clear").addEventListener("click", () => { logLines.length = 0; $("log").textContent = ""; });
   $("copy").addEventListener("click", async () => {
-    const table = ["sentUtc", "sentKst", "sentLocal", "sentEpoch", "readUtc", "diff", "fw", "prof"].map(id => `${id}: ${$(id).textContent}`).join("\n");
-    const text = `PRD-279 set-time diagnostic\nresult: ${$("result").innerText}\n${table}\n---\n${logLines.join("\n")}`;
+    const table = ["sentUtc", "sentKst", "sentLocal", "sentEpoch", "readUtc", "diff", "fw", "prof", "sd"].map(id => `${id}: ${$(id).textContent}`).join("\n");
+    const text = `imu-clock diagnostic\nresult: ${$("result").innerText}\n${table}\n---\n${logLines.join("\n")}`;
     try { await navigator.clipboard.writeText(text); alert("Diagnostic log copied. Paste it into WhatsApp/email to us."); }
     catch (e) {
       const ta = document.createElement("textarea"); ta.value = text; document.body.appendChild(ta); ta.select();
